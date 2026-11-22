@@ -1,0 +1,25 @@
+# Dependências fixadas nas versões em que este lab foi executado de ponta a ponta
+# (22/nov/2026). Numa pilha de observabilidade, dependência solta é como alerta sem
+# dono: funciona até o dia em que o mundo muda embaixo de você.
+#
+# Motivo real, não superstição: com `fastapi>=0.115` solto, o resolve instala
+# FastAPI 0.162 + Starlette 1.x, onde o argumento `lifecycle=` do construtor não
+# existe mais — o serviço morre no boot e a culpa sobra para o OTel.
+#
+# Uso local:
+#   pip install -r requirements.txt
+#   python3 -m uvicorn --app-dir src instrumentacao_fastapi:app --port 8080
+#
+# Para atualizar: mude a versão, rode o teste de fumaça do README e
+# `python3 dashboards/validate.py`, e commite as duas coisas juntas.
+
+fastapi==0.162.0
+uvicorn==0.54.0
+httpx==0.28.1
+
+# Telemetria. Se o SDK faltar, o serviço degrada e /health informa
+# (ver Telemetria.disponivel em src/instrumentacao_fastapi.py).
+opentelemetry-api==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-semantic-conventions==0.66b2

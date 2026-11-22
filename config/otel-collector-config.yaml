@@ -1,0 +1,145 @@
+# otel-collector-config.yaml — Collector do lab de correlação de jornada.
+#
+# Implementação de referência própria, reconstruída de prática. Nenhum valor aqui
+# vem de ambiente real: não há endpoint, credencial, tenant ou hostname interno.
+#
+# O que este arquivo resolve no desenho:
+#   1. UM ponto de normalização de recurso. `service.name`, `service.namespace`
+#      e `deployment.environment.name` são completados aqui, não em cada app.
+#   2. TRES pipelines com a MESMA chave de correlação viajando neles.
+#      traces -> Jaeger · metrics -> Prometheus (por exporter, não remote write)
+#      logs -> Loki. É o mínimo para provar o mapa do README.
+#   3. Um lugar onde se decide amostragem. No lab: 100% dos traces, porque ver o
+#      trace inteiro É o objetivo didático. Em produção isso é inaceitável, e o
+#      bloco comentado de tail sampling mostra o que muda.
+#
+# Validação local (sem subir nada):
+#   docker run --rm -v "$PWD/config:/cfg:ro" \
+#     otel/opentelemetry-collector-contrib:0.165.0 validate --config /cfg/otel-collector-config.yaml
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 2s
+    # 90% do limite do container; o container tem 512M no compose.
+    limit_percentage: 80
+    spike_limit_percentage: 15
+
+  resource/labelling:
+    actions:
+      - key: service.namespace
+        from_attribute: service.namespace
+        action: upsert
+      - key: deployment.environment.name
+        from_attribute: deployment.environment.name
+        action: upsert
+      - key: lab
+        value: otel-correlation
+        action: insert
+      # Atributo que marca a fronteira como conhecida do pipeline. Ele existe para
+      # o painel poder responder "destes traces, quantos sabiam que iam morrer no
+      # legado?" sem depender de convenção de nome de serviço.
+      - key: boundary.known
+        from_attribute: boundary.known
+        action: upsert
+
+  # Copia o ID de negócio (baggage promoted a attribute pelo SDK) para os campos
+  # canônicos usados em log e métrica de fronteira. Sem isso, cada linguagem
+  # grava num lugar diferente e a consulta vira arqueologia.
+  transform/correlacao:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["correlation_id"], attributes["sre.correlation_id"]) where attributes["correlation_id"] == nil
+          - set(attributes["jornada"], attributes["sre.jornada"]) where attributes["jornada"] == nil
+    span_statements:
+      - set(attributes["correlation.id"], attributes["sre.correlation_id"]) where attributes["correlation.id"] == nil
+
+  batch:
+    send_batch_size: 512
+    timeout: 3s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Métrica OTLP vira série Prometheus num endpoint /metrics do próprio Collector.
+  # Consequência declarada no README: este caminho é PUSH e não preserva exemplar,
+  # então o drilldown métrica->trace aqui se faz pelo atributo correlation.id no log,
+  # não pelo ponto verde no gráfico.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    send_timestamps: true
+    metric_expiration: 30m
+    resource_to_telemetry_conversion:
+      # publica resource attributes como labels; é o que faz service_name aparecer
+      # no PromQL deste lab. Em escala, isto é caro - leia a limitação no README.
+      enabled: true
+
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+  debug:
+    verbosity: basic
+    sampling_initial: 3
+    sampling_thereafter: 300
+
+service:
+  telemetry:
+    logs:
+      level: info
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/labelling, transform/correlacao, batch]
+      exporters: [otlp/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/labelling, transform/correlacao, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/labelling, transform/correlacao, batch]
+      exporters: [otlphttp/loki, debug]
+      # Amostragem de produção (comentada porque no lab o objetivo é ver tudo):
+      # head sampling decide sem saber se deu erro e descarta justamente a cauda.
+      # traces:
+      #   processors: [memory_limiter, resource/labelling, transform/correlacao,
+      #                probabilistic_sampler, batch]
+      # probabilistic_sampler:
+      #   sampling_percentage: 1
+      #
+      # Em produção eu usaria tail_sampling (decide no fim do traço, com status e
+      # latência em mãos), pagando memória de buffer e latência de decisão:
+      # tail_sampler:
+      #   decision_wait: 10s
+      #   policies:
+      #     - name: erro
+      #       type: status_code
+      #       status_code: { status_codes: [ERROR] }
+      #     - name: cauda-lenta
+      #       type: latency
+      #       latency: { threshold_ms: 650 }
+      #     - name: travessia-de-fronteira
+      #       type: string_attribute
+      #       string_attribute: { key: boundary.known, values: ["true"] }
+      #     - name: resto
+      #       type: probabilistic
+      #       probabilistic: { sampling_percentage: 1 }

@@ -1,0 +1,169 @@
+# docker-compose.yml — lab de correlação de jornada (distribuído -> fronteira sem tracing).
+#
+# Rode `docker compose up -d` e siga "Teste de fumaça" no README.
+# Portas amarradas em 127.0.0.1: nada aqui fica exposto na rede. Sem TLS, sem
+# autenticação, sem persistência: é um lab, não um padrão de implantação.
+#
+# VALIDAÇÃO FEITA NESTE REPOSITÓRIO: YAML parseado e chaves conferidas contra a
+# documentação de cada versão pinada. O stack NÃO foi executado no ambiente onde
+# este repositório foi escrito (sem binário docker disponível) - está declarado
+# em "Limitações" no README. Se você rodar e algo não subir, o bug é meu: abra uma
+# issue com a saída de `docker compose ps` e `docker compose logs <serviço>`.
+
+name: otel-correlation-lab
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.165.0
+    container_name: otlp-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"   # OTLP/gRPC
+      - "127.0.0.1:4318:4318"   # OTLP/HTTP (é aqui que o shim da fronteira entrega log)
+      - "127.0.0.1:8889:8889"   # métricas OTLP convertidas para Prometheus
+      - "127.0.0.1:13133:13133" # health_check
+    # Nota: isto valida o CONFIG, não a prontidão do pipeline. Serve para
+    # pegar config quebrada em 20s; não é prova de que há dados fluindo.
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config", "/etc/otelcol/config.yaml"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      jaeger:
+        condition: service_started
+      loki:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: "badger"
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: "/badger/data"
+      BADGER_DIRECTORY_KEYS: "/badger/keys"
+    volumes:
+      - jaeger-data:/badger
+    ports:
+      - "127.0.0.1:16686:16686" # UI: procure por service.name=api-gateway
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      # exemplar continua habilitado: é o caminho de volta de métrica para trace
+      # mesmo quando o grafico usa a série vinda do exporter (limitação declarada).
+      - --enable-feature=exemplar-storage
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.5.1
+    container_name: loki
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./config/loki-config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "127.0.0.1:3100:3100"
+    healthcheck:
+      test: ["CMD", "/usr/bin/loki", "-config.file=/etc/loki/config.yaml", "-verify.config"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.6
+    container_name: grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"   # só porque isto é um lab local
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
+
+  # Borda distribuída: FastAPI + OpenTelemetry. Instala dependências no start
+  # para não exigir Dockerfile nem lockfile neste lab (limitação declarada no
+  # README: em produção a imagem é construída com versão pinada e lockfile).
+  api-gateway:
+    image: python:3.12-slim
+    container_name: api-gateway
+    working_dir: /app
+    volumes:
+      - ./src:/app:ro
+      - ./requirements.txt:/app/requirements.txt:ro
+    command:
+      - sh
+      - -c
+      - |
+        pip install --no-cache-dir --quiet -r requirements.txt &&
+        uvicorn instrumentacao_fastapi:app --host 0.0.0.0 --port 8080 --log-level warning
+    environment:
+      OTEL_SERVICE_NAME: api-gateway
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=jornada-pagamento,deployment.environment.name=lab
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      FRONTEIRA_URL: http://fronteira-transacional:8090/transacao
+      AMBIENTE: lab
+      REGIAO: br-sp-1
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  # A fronteira: processo stdlib que NÃO fala OTel para dentro. O único rastro que
+  # sai daqui é (a) linha de relatório no stdout, (b) shim OTLP/HTTP de log para o
+  # Collector e (c) /metricos em texto Prometheus.
+  fronteira-transacional:
+    image: python:3.12-slim
+    container_name: fronteira-transacional
+    working_dir: /app
+    volumes:
+      - ./src:/app:ro
+    command: ["python", "fronteira_transacional.py", "--bind", "0.0.0.0", "--porta", "8090",
+              "--skew-ms", "420", "--demora-base-ms", "180",
+              "--formato-id", "maiusculo-sem-hifen"]
+    environment:
+      COLETOR_LOGS_URL: http://otel-collector:4318/v1/logs
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  jaeger-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
