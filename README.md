@@ -328,3 +328,21 @@ checked offline by a stdlib validator (`dashboards/validate.py`) that verifies e
 exists in `src/` or is exported by the collector — panels that reference phantom metrics fail in CI, not during
 an incident. All seven containers bind to `127.0.0.1`; there are no credentials, hosts, clients or production
 data anywhere in the repository.
+
+## Pipeline de verificacao
+
+O portao roda offline: sem nuvem, sem registry, sem servico externo. A definicao esta
+no arquivo `.ci/ci.yml` deste repositorio e vale como pipeline para qualquer CI.
+Para transformar em GitHub Actions basta copiar para `.github/workflows/ci.yml`:
+
+```bash
+mkdir -p .github/workflows && cp .ci/ci.yml .github/workflows/ci.yml
+```
+
+O que cada portao verifica, com o resultado medido nesta maquina:
+
+| portao | o que verifica | resultado |
+|---|---|---|
+| `python3 dashboards/validate.py --strict --json` | schema, paineis, datasource e consistencia de labels | 0 erros, 0 avisos (22/11/2026) |
+| AST de todo `*.py` | sintaxe de instrumentacao, fronteira transacional e scripts | 3 arquivos, sem erro |
+| `bash scripts/fumaca.sh` | traco de ponta a ponta em loopback | roda local; o CI nao sobe servicos |
